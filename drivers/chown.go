@@ -5,10 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/containers/storage/pkg/idtools"
 	"github.com/containers/storage/pkg/reexec"
+	"github.com/stretchr/powerwalk"
 )
 
 const (
@@ -60,7 +60,7 @@ func chownByMapsMain() {
 		}
 		return platformLChown(path, info, toHost, toContainer)
 	}
-	if err := filepath.Walk(".", chown); err != nil {
+	if err := powerwalk.Walk(".", chown); err != nil {
 		fmt.Fprintf(os.Stderr, "error during chown: %v", err)
 		os.Exit(1)
 	}
