@@ -21,6 +21,7 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	digest "github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -41,6 +42,9 @@ type layer struct {
 	id        string
 	cacheFile *cacheFile
 	target    string
+	// mmapBuffer is nil when the cache file is fully loaded in memory.
+	// Otherwise it points to a mmap'ed buffer that is referenced by cacheFile.vdata.
+	mmapBuffer []byte
 }
 
 type layersCache struct {
@@ -61,9 +65,15 @@ func (c *layersCache) release() {
 	defer cacheMutex.Unlock()
 
 	c.refs--
-	if c.refs == 0 {
-		cache = nil
+	if c.refs != 0 {
+		return
 	}
+	for _, l := range c.layers {
+		if l.mmapBuffer != nil {
+			unix.Munmap(l.mmapBuffer)
+		}
+	}
+	cache = nil
 }
 
 func getLayersCacheRef(store storage.Store) *layersCache {
@@ -91,83 +101,135 @@ func getLayersCache(store storage.Store) (*layersCache, error) {
 	return c, nil
 }
 
+// loadLayerBigData attempts to load the specified cacheKey from a file and mmap its content.
+// If the cache is not backed by a file, then it loads the entire content in memory.
+// Returns the cache content, and if mmap'ed, the mmap buffer to Munmap.
+func (c *layersCache) loadLayerBigData(layerID, cacheKey string) ([]byte, []byte, error) {
+	inputFile, err := c.store.LayerBigData(layerID, cacheKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer inputFile.Close()
+
+	// if the cache is backed by a file, attempt to mmap it.
+	if osFile, ok := inputFile.(*os.File); ok {
+		st, err := osFile.Stat()
+		if err != nil {
+			return nil, nil, err
+		}
+		size := st.Size()
+		if size == 0 {
+			return nil, nil, nil
+		}
+		buf, err := unix.Mmap(int(osFile.Fd()), 0, int(size), unix.PROT_READ, unix.MAP_SHARED)
+		if err != nil {
+			return nil, nil, err
+		}
+		// best effort advise to the kernel.
+		_ = unix.Madvise(buf, unix.MADV_RANDOM)
+
+		return buf, buf, err
+	}
+	buf, err := io.ReadAll(inputFile)
+	return buf, nil, err
+}
+
+func (c *layersCache) loadLayerCache(layerID string) (bool, error) {
+	buffer, mmapBuffer, err := c.loadLayerBigData(layerID, cacheKey)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	// there is no existing cache to load
+	if err != nil || buffer == nil {
+		return false, nil
+	}
+
+	cacheFile, err := readCacheFileFromMemory(buffer)
+	if err != nil {
+		if mmapBuffer != nil {
+			unix.Munmap(mmapBuffer)
+		}
+		return false, err
+	}
+	if err := c.addLayer(layerID, cacheFile, mmapBuffer); err != nil {
+		// the mmap'ed data is not owned by the cache manager on errors
+		if mmapBuffer != nil {
+			unix.Munmap(mmapBuffer)
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (c *layersCache) createCacheFileFromTOC(layerID string) error {
+	clFile, err := c.store.LayerBigData(layerID, chunkedLayerDataKey)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if clFile == nil {
+		return nil
+	}
+	cl, err := io.ReadAll(clFile)
+	if err != nil {
+		return fmt.Errorf("open manifest file: %w", err)
+	}
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
+
+	var lcd chunkedLayerData
+	if err := json.Unmarshal(cl, &lcd); err != nil {
+		return err
+	}
+	manifestReader, err := c.store.LayerBigData(layerID, bigDataKey)
+	if err != nil {
+		return err
+	}
+	defer manifestReader.Close()
+
+	manifest, err := io.ReadAll(manifestReader)
+	if err != nil {
+		return fmt.Errorf("read manifest file: %w", err)
+	}
+
+	cacheFile, err := writeCache(manifest, lcd.Format, layerID, c.store)
+	if err != nil {
+		return err
+	}
+	return c.addLayer(layerID, cacheFile, nil)
+}
+
 func (c *layersCache) load() error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	existingLayers := make(map[string]struct{})
+	for _, r := range c.layers {
+		// ignore the layer if it was fully loaded in memory.
+		// In this way it can be reloaded using mmap.
+		if r.mmapBuffer != nil {
+			existingLayers[r.id] = struct{}{}
+		}
+	}
 	allLayers, err := c.store.Layers()
 	if err != nil {
 		return err
 	}
-	existingLayers := make(map[string]string)
-	for _, r := range c.layers {
-		existingLayers[r.id] = r.target
-	}
-
-	currentLayers := make(map[string]string)
 	for _, r := range allLayers {
-		currentLayers[r.ID] = r.ID
 		if _, found := existingLayers[r.ID]; found {
 			continue
 		}
-
-		bigData, err := c.store.LayerBigData(r.ID, cacheKey)
-		// if the cache already exists, read and use it
-		if err == nil {
-			defer bigData.Close()
-			cacheFile, err := readCacheFileFromReader(bigData)
-			if err == nil {
-				c.addLayer(r.ID, cacheFile)
-				continue
-			}
-			logrus.Warningf("Error reading cache file for layer %q: %v", r.ID, err)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-
-		var lcd chunkedLayerData
-
-		clFile, err := c.store.LayerBigData(r.ID, chunkedLayerDataKey)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		if clFile != nil {
-			cl, err := io.ReadAll(clFile)
-			if err != nil {
-				return fmt.Errorf("open manifest file for layer %q: %w", r.ID, err)
-			}
-			json := jsoniter.ConfigCompatibleWithStandardLibrary
-			if err := json.Unmarshal(cl, &lcd); err != nil {
-				return err
-			}
-		}
-
-		// otherwise create it from the layer TOC.
-		manifestReader, err := c.store.LayerBigData(r.ID, bigDataKey)
+		// try to read the existing cache file
+		loaded, err := c.loadLayerCache(r.ID)
 		if err != nil {
+			logrus.Warningf("Error loading cache file for layer %q: %v", r.ID, err)
+		}
+		if loaded {
 			continue
 		}
-		defer manifestReader.Close()
-
-		manifest, err := io.ReadAll(manifestReader)
-		if err != nil {
-			return fmt.Errorf("open manifest file for layer %q: %w", r.ID, err)
-		}
-
-		cacheFile, err := writeCache(manifest, lcd.Format, r.ID, c.store)
-		if err == nil {
-			c.addLayer(r.ID, cacheFile)
+		// the cache file is either not present or broken.  Try to generate it.
+		if err := c.createCacheFileFromTOC(r.ID); err != nil {
+			logrus.Warningf("Error creating cache file for layer %q: %v", r.ID, err)
 		}
 	}
-
-	var newLayers []layer
-	for _, l := range c.layers {
-		if _, found := currentLayers[l.id]; found {
-			newLayers = append(newLayers, l)
-		}
-	}
-	c.layers = newLayers
-
 	return nil
 }
 
@@ -237,7 +299,7 @@ func writeCache(manifest []byte, format graphdriver.DifferOutputFormat, id strin
 	digestLen := 0
 	var tagsBuffer bytes.Buffer
 
-	toc, err := prepareMetadata(manifest, format)
+	toc, err := prepareCacheFile(manifest, format)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +334,6 @@ func writeCache(manifest []byte, format graphdriver.DifferOutputFormat, id strin
 			if _, err := vdata.Write(location); err != nil {
 				return nil, err
 			}
-
 			digestLen = len(k.Digest)
 		}
 		if k.ChunkDigest != "" {
@@ -377,7 +438,9 @@ func writeCache(manifest []byte, format graphdriver.DifferOutputFormat, id strin
 	}, nil
 }
 
-func readCacheFileFromReader(bigData io.Reader) (*cacheFile, error) {
+func readCacheFileFromMemory(bigDataBuffer []byte) (*cacheFile, error) {
+	bigData := bytes.NewReader(bigDataBuffer)
+
 	var version, tagLen, digestLen, tagsLen, vdataLen uint64
 	if err := binary.Read(bigData, binary.LittleEndian, &version); err != nil {
 		return nil, err
@@ -403,10 +466,8 @@ func readCacheFileFromReader(bigData io.Reader) (*cacheFile, error) {
 		return nil, err
 	}
 
-	vdata := make([]byte, vdataLen)
-	if _, err := bigData.Read(vdata); err != nil {
-		return nil, err
-	}
+	// retrieve the unread part of the buffer.
+	vdata := bigDataBuffer[len(bigDataBuffer)-bigData.Len():]
 
 	return &cacheFile{
 		tagLen:    int(tagLen),
@@ -416,7 +477,7 @@ func readCacheFileFromReader(bigData io.Reader) (*cacheFile, error) {
 	}, nil
 }
 
-func prepareMetadata(manifest []byte, format graphdriver.DifferOutputFormat) ([]*internal.FileMetadata, error) {
+func prepareCacheFile(manifest []byte, format graphdriver.DifferOutputFormat) ([]*internal.FileMetadata, error) {
 	toc, err := unmarshalToc(manifest)
 	if err != nil {
 		// ignore errors here.  They might be caused by a different manifest format.
@@ -455,16 +516,17 @@ func prepareMetadata(manifest []byte, format graphdriver.DifferOutputFormat) ([]
 	return r, nil
 }
 
-func (c *layersCache) addLayer(id string, cacheFile *cacheFile) error {
+func (c *layersCache) addLayer(id string, cacheFile *cacheFile, mmapBuffer []byte) error {
 	target, err := c.store.DifferTarget(id)
 	if err != nil {
 		return fmt.Errorf("get checkout directory layer %q: %w", id, err)
 	}
 
 	l := layer{
-		id:        id,
-		cacheFile: cacheFile,
-		target:    target,
+		id:         id,
+		cacheFile:  cacheFile,
+		target:     target,
+		mmapBuffer: mmapBuffer,
 	}
 	c.layers = append(c.layers, l)
 	return nil
