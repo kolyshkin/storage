@@ -7,6 +7,6 @@ package tools
 // `go mod vendor`.
 
 import (
-	_ "github.com/cpuguy83/go-md2man"
+	_ "github.com/cpuguy83/go-md2man/v2"
 	_ "github.com/vbatts/git-validation"
 )

@@ -10,7 +10,7 @@ vendor:
 	$(GO) mod verify
 
 define go-build
-	$(shell cd `pwd` && $(GO) build -mod=vendor -o $(BUILDDIR)/$(shell basename $(1)) $(1))
+	$(shell cd `pwd` && $(GO) build -mod=vendor -o $(BUILDDIR)/$(or $(2),$(shell basename $(1))) $(1))
 	@echo > /dev/null
 endef
 
@@ -27,7 +27,7 @@ $(BUILDDIR)/git-validation:
 	$(call go-build,./vendor/github.com/vbatts/git-validation)
 
 $(BUILDDIR)/go-md2man:
-	$(call go-build,./vendor/github.com/cpuguy83/go-md2man)
+	$(call go-build,./vendor/github.com/cpuguy83/go-md2man/v2,go-md2man)
 
 $(BUILDDIR)/golangci-lint:
 	@[ "${GOLANGCI_LINT_VERSION}" ] || ( echo "GOLANGCI_LINT_VERSION is not set"; exit 1 )
